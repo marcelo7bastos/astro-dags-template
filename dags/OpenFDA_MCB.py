@@ -14,7 +14,7 @@ from datetime import datetime, date
 
 # ===== CONFIG =====
 GCP_PROJECT  = "365846072239"            # seu project id (numérico funciona)
-BQ_DATASET   = "crypto"                  # ajuste se preferir outro dataset
+BQ_DATASET   = "dataset_fda"                  # ajuste se preferir outro dataset
 BQ_TABLE     = "openfda_sildenafil_weekly"
 BQ_LOCATION  = "US"
 GCP_CONN_ID  = "google_cloud_default"    # conexão GCP no Airflow
