@@ -118,7 +118,7 @@ def fetch_month_and_to_gbq():
 
 
 @dag(
-    dag_id="openfda_to_gbq",
+    dag_id="openfda_mcb",
     schedule="@monthly",
     start_date=pendulum.datetime(2020, 11, 1, tz="UTC"),
     catchup=True,
