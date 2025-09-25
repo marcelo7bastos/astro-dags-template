@@ -1,137 +1,158 @@
-# dags/openfda_mcb2_test.py
+# dags/openfda_mcb2_test_range.py
 from __future__ import annotations
 
 from airflow.decorators import dag, task
-from airflow.operators.python import get_current_context
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
-from datetime import timedelta
 import pendulum
 import pandas as pd
 import requests
+from datetime import date
 
 # ============================================================
-# CONFIGURAÇÕES (ajuste se necessário)
+# CONFIGURAÇÕES GERAIS (edite aqui para ajustes rápidos)
 # ============================================================
-GCP_PROJECT  = "365846072239"      # seu project id (numérico ou string)
-BQ_DATASET   = "dataset_fda"       # dataset no BigQuery
-BQ_TABLE     = "openfda_sildenafil_daily_test"   # tabela de destino (teste!)
+
+# --- Alvo no BigQuery ---
+GCP_PROJECT  = "365846072239"
+BQ_DATASET   = "dataset_fda"
+BQ_TABLE     = "openfda_sildenafil_range_test"   # tabela de teste (intervalo fixo)
 BQ_LOCATION  = "US"
-GCP_CONN_ID  = "google_cloud_default"  # conexão GCP configurada no Airflow
-POOL_NAME    = "openfda_api"           # pode reaproveitar o pool já existente
+GCP_CONN_ID  = "google_cloud_default"
+
+# --- Controle de execução ---
+USE_POOL     = True
+POOL_NAME    = "openfda_api"    # se não quiser pool, defina USE_POOL=False
+
+# --- Parâmetros do teste (INTERVALO FIXO) ---
+# Esta seção faz a DAG consultar SEMPRE o mesmo intervalo,
+# igual ao que você testou no navegador.
+TEST_START = date(2025, 6, 1)   # AAAA, M, D
+TEST_END   = date(2025, 7, 29)  # inclusive
+DRUG_QUERY = 'sildenafil+citrate'  # termo usado no campo medicinalproduct
+
+# Observação:
+# - Mantemos agregação DIÁRIA (count=receivedate) — exatamente como na URL.
+# - Se quiser voltar ao modo “um dia por execução”, basta criar outra task
+#   com `data_interval_start` e trocar a montagem da URL (ver notas no fim).
 # ============================================================
 
-# Criamos uma sessão HTTP com um cabeçalho "educado"
+# Sessão HTTP com cabeçalho “educado”
 SESSION = requests.Session()
 SESSION.headers.update(
     {"User-Agent": "mda-openfda-etl/1.0 (contato: voce@exemplo.gov.br)"}
 )
 
 
-def _openfda_get(url: str):
+def _openfda_get(url: str) -> dict:
     """
-    Consulta simples à API openFDA (SEM retries, para testes).
-    Se a API responder com erro, a execução falha imediatamente.
+    Chamada simples à openFDA **sem retries**.
+    IMPORTANTE: a openFDA retorna **404** quando não há resultados para a query.
+    Aqui tratamos 404 como "vazio" (results=[]), para o task concluir com sucesso.
     """
     r = SESSION.get(url, timeout=30)
-    r.raise_for_status()   # se vier erro 4xx ou 5xx, levanta exceção
+    if r.status_code == 404:
+        return {"results": []}
+    r.raise_for_status()
     return r.json()
 
 
-@task(pool=POOL_NAME, retries=0)  # <<< sem retries no Airflow
-def fetch_day_and_to_gbq():
+def _build_openfda_url(start: date, end: date, drug_query: str) -> str:
     """
-    Task de teste:
-      - pega o dia do run (data_interval_start)
-      - consulta a API openFDA para "sildenafil citrate"
-      - agrega no nível diário (semana não é necessária aqui)
-      - grava no BigQuery
+    Monta a URL da openFDA exatamente como no seu teste:
+      - filtro em patient.drug.medicinalproduct:"<drug_query>"
+      - janela de receivedate [start .. end] (formato AAAAMMDD)
+      - count=receivedate  -> buckets diários
     """
-    # -----------------------------------------------------------------
-    # 1) Descobre o dia de referência do run
-    # -----------------------------------------------------------------
-    ctx = get_current_context()
-    run_day = ctx["data_interval_start"].date()   # exemplo: 2025-09-23
-    day_str = run_day.strftime("%Y%m%d")          # formato AAAAMMDD
-
-    # -----------------------------------------------------------------
-    # 2) Monta a URL para consultar a API openFDA
-    # -----------------------------------------------------------------
-    url = (
+    start_str = start.strftime("%Y%m%d")
+    end_str   = end.strftime("%Y%m%d")
+    # Observação: o termo da droga vem já com '+' entre palavras (URL-friendly).
+    return (
         "https://api.fda.gov/drug/event.json"
-        f"?search=patient.drug.medicinalproduct:%22sildenafil+citrate%22"
-        f"+AND+receivedate:[{day_str}+TO+{day_str}]"
+        f"?search=patient.drug.medicinalproduct:%22{drug_query}%22"
+        f"+AND+receivedate:[{start_str}+TO+{end_str}]"
         "&count=receivedate"
     )
+
+
+# Decorator do task: sem retries; pool opcional
+_task_kwargs = dict(retries=0)
+if USE_POOL:
+    _task_kwargs["pool"] = POOL_NAME
+
+
+@task(**_task_kwargs)
+def fetch_fixed_range_and_to_bq():
+    """
+    Task de TESTE por intervalo fixo:
+      1) Monta a URL com TEST_START..TEST_END e DRUG_QUERY.
+      2) Chama a API openFDA (404 => "sem resultados").
+      3) Converte retorno em DataFrame diário (time, events).
+      4) Grava no BigQuery (append) com colunas:
+           - time   (TIMESTAMP UTC do dia)
+           - events (contagem diária)
+           - win_start (DATE)  -> início do intervalo consultado
+           - win_end   (DATE)  -> fim do intervalo consultado
+           - drug      (STRING)-> termo consultado (p/ rastreio)
+    """
+    # 1) Monta a URL EXATAMENTE como a que funcionou no navegador
+    url = _build_openfda_url(TEST_START, TEST_END, DRUG_QUERY)
     print("[openFDA] URL:", url)
 
-    # -----------------------------------------------------------------
-    # 3) Chama a API e coleta os resultados
-    # -----------------------------------------------------------------
+    # 2) Chama a API e trata “sem resultados”
     data = _openfda_get(url)
     results = data.get("results", [])
     if not results:
-        print("Sem resultados para o dia:", run_day)
+        print(f"[openFDA] Sem resultados para {TEST_START}..{TEST_END} (drug={DRUG_QUERY}).")
         return
 
-    # -----------------------------------------------------------------
-    # 4) Converte em DataFrame pandas
-    # -----------------------------------------------------------------
+    # 3) Converte para DataFrame
     df = pd.DataFrame(results)  # colunas: time (AAAAMMDD), count
     df["time"] = pd.to_datetime(df["time"], format="%Y%m%d", utc=True)
+    df = df.rename(columns={"count": "events"})
+    df["win_start"] = pd.to_datetime(TEST_START)
+    df["win_end"]   = pd.to_datetime(TEST_END)
+    df["drug"]      = DRUG_QUERY.replace("+", " ")  # para ficar legível no BQ
 
-    # preview no log
-    print(df.head().to_string())
+    print("[openFDA] Prévia dos dados:\n", df.head().to_string())
 
-    # -----------------------------------------------------------------
-    # 5) Prepara escrita no BigQuery
-    # -----------------------------------------------------------------
-    bq_hook = BigQueryHook(
-        gcp_conn_id=GCP_CONN_ID,
-        location=BQ_LOCATION,
-        use_legacy_sql=False
-    )
+    # 4) Escreve no BigQuery
+    bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
     credentials = bq_hook.get_credentials()
 
-    destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+    # Esquema explícito (bom para evitar inferências ruins do pandas-gbq)
     schema = [
-        {"name": "time",   "type": "TIMESTAMP"},
-        {"name": "events", "type": "INTEGER"},
-        {"name": "day",    "type": "DATE"},   # dia de referência do run
+        {"name": "time",      "type": "TIMESTAMP"},
+        {"name": "events",    "type": "INTEGER"},
+        {"name": "win_start", "type": "DATE"},
+        {"name": "win_end",   "type": "DATE"},
+        {"name": "drug",      "type": "STRING"},
     ]
 
-    df = df.rename(columns={"count": "events"})
-    df["day"] = pd.to_datetime(run_day)
-
-    # -----------------------------------------------------------------
-    # 6) Grava no BigQuery (append simples)
-    # -----------------------------------------------------------------
     df.to_gbq(
-        destination_table=destination_table,
+        destination_table=f"{BQ_DATASET}.{BQ_TABLE}",
         project_id=GCP_PROJECT,
-        if_exists="append",
+        if_exists="append",           # teste: acrescenta linhas
         credentials=credentials,
         table_schema=schema,
         location=BQ_LOCATION,
         progress_bar=False,
     )
-
-    print(f"Gravados {len(df)} registros em {GCP_PROJECT}.{destination_table}.")
+    print(f"[BQ] Gravados {len(df)} registros em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}.")
 
 
 # ============================================================
 # DEFINIÇÃO DA DAG
 # ============================================================
 @dag(
-    dag_id="openfda_mcb2_test",
-    schedule="@daily",   # <<< agora roda todo dia
+    dag_id="openfda_mcb2_test_range",
+    schedule="@once",  # roda uma vez (é teste de intervalo fixo); mude para @daily se quiser
     start_date=pendulum.datetime(2025, 9, 23, tz="UTC"),
-    catchup=True,
+    catchup=False,     # como é intervalo fixo, não queremos runs históricos
     max_active_runs=1,
-    tags=["openfda", "bigquery", "test"],
+    tags=["openfda", "bigquery", "test", "range"],
 )
-def openfda_pipeline_test():
-    fetch_day_and_to_gbq()
+def openfda_pipeline_test_range():
+    fetch_fixed_range_and_to_bq()
 
-# Instancia a DAG
-dag = openfda_pipeline_test()
+dag = openfda_pipeline_test_range()
