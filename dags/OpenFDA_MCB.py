@@ -120,7 +120,7 @@ def fetch_month_and_to_gbq():
 @dag(
     dag_id="openfda_mcb",
     schedule="@monthly",
-    start_date=pendulum.datetime(2025, 09, 1, tz="UTC"),
+    start_date=pendulum.datetime(2025, 9, 1, tz="UTC"),
     catchup=True,
     max_active_runs=1,     # importante p/ evitar rajadas
     tags=["openfda", "bigquery"],
