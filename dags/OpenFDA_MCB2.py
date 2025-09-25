@@ -1,4 +1,4 @@
-# dags/openfda_mcb.py
+# dags/openfda_mcb2.py
 from __future__ import annotations
 
 from airflow.decorators import dag, task
@@ -118,9 +118,9 @@ def fetch_month_and_to_gbq():
 
 
 @dag(
-    dag_id="openfda_mcb",
+    dag_id="openfda_mcb2",
     schedule="@monthly",
-    start_date=pendulum.datetime(2025, 9, 1, tz="UTC"),
+    start_date=pendulum.datetime(2025, 9, 23, tz="UTC"),
     catchup=True,
     max_active_runs=1,     # importante p/ evitar rajadas
     tags=["openfda", "bigquery"],
