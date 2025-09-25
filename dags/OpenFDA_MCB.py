@@ -120,12 +120,12 @@ def fetch_month_and_to_gbq():
 @dag(
     dag_id="openfda_mcb",
     schedule="@monthly",
-    start_date=pendulum.datetime(2020, 11, 1, tz="UTC"),
+    start_date=pendulum.datetime(2025, 09, 1, tz="UTC"),
     catchup=True,
     max_active_runs=1,     # importante p/ evitar rajadas
     tags=["openfda", "bigquery"],
 )
-def openfda_pipeline():
+def openfda_pipeline2():
     fetch_month_and_to_gbq()
 
-dag = openfda_pipeline()
+dag = openfda_pipeline2()
