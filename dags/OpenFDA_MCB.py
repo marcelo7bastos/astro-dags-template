@@ -1,4 +1,4 @@
-# dags/openfda_to_gbq.py
+# dags/openfda_mcb.py
 from __future__ import annotations
 
 from airflow.decorators import dag, task
