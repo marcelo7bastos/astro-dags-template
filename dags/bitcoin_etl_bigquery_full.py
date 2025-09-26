@@ -72,12 +72,15 @@ def fetch_and_to_gbq():
     session.headers.update({"User-Agent": "mda-coingecko-etl/1.0"})
 
     # Lê a chave do Airflow Variables (falha explícita se não existir)
-    DEMO_KEY = Variable.get("intro-ciencia-dados", default_var=None)
-    if not DEMO_KEY:
+    try:
+        DEMO_KEY = Variable.get("intro-ciencia-dados")
+    except KeyError:
         raise AirflowFailException(
             "A variável Airflow 'intro-ciencia-dados' não está definida. "
-            "Cadastre a sua Demo API Key em Admin > Variables."
+            "Cadastre sua Demo API Key em Admin > Variables."
         )
+    
+    DEMO_KEY = DEMO_KEY.strip()
     session.headers.update({"x-cg-demo-api-key": DEMO_KEY})
 
     retry = Retry(
