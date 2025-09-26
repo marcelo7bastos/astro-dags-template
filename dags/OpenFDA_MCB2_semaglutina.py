@@ -1,4 +1,4 @@
-# dags/api_fda_semaglutina_to_db_dag.py
+# dags/api_fda_semaglutine_to_db_dag.py
 from __future__ import annotations
 
 from airflow.decorators import dag, task
@@ -16,7 +16,7 @@ from datetime import date
 # --- Alvo no BigQuery ---
 GCP_PROJECT  = "365846072239"
 BQ_DATASET   = "dataset_fda"
-BQ_TABLE     = "openfda__semaglutina"   # tabela de teste (intervalo fixo)
+BQ_TABLE     = "openfda_semaglutina"   # tabela de teste (intervalo fixo; agregação diária)
 BQ_LOCATION  = "US"
 GCP_CONN_ID  = "google_cloud_default"
 
@@ -29,7 +29,7 @@ POOL_NAME    = "openfda_api"    # se não quiser pool, defina USE_POOL=False
 # igual ao que você testou no navegador.
 TEST_START = date(2025, 1, 1)   # AAAA, M, D
 TEST_END   = date(2025, 3, 29)  # inclusive
-DRUG_QUERY = 'sildenafil+citrate'  # termo usado no campo medicinalproduct
+DRUG_QUERY = "semaglutide"      # ✅ alinhado ao seu teste por generic_name
 
 # Observação:
 # - Mantemos agregação DIÁRIA (count=receivedate) — exatamente como na URL.
@@ -60,16 +60,16 @@ def _openfda_get(url: str) -> dict:
 def _build_openfda_url(start: date, end: date, drug_query: str) -> str:
     """
     Monta a URL da openFDA exatamente como no seu teste:
-      - filtro em patient.drug.medicinalproduct:"<drug_query>"
+      - filtro em patient.drug.openfda.generic_name:"<drug_query>"
       - janela de receivedate [start .. end] (formato AAAAMMDD)
       - count=receivedate  -> buckets diários
     """
     start_str = start.strftime("%Y%m%d")
     end_str   = end.strftime("%Y%m%d")
-    # Observação: o termo da droga vem já com '+' entre palavras (URL-friendly).
+    # Observação: o termo da droga é simples (sem espaços) no generic_name.
     return (
         "https://api.fda.gov/drug/event.json"
-        f"?search=patient.drug.medicinalproduct:%22{drug_query}%22"
+        f"?search=patient.drug.openfda.generic_name:%22{drug_query}%22"
         f"+AND+receivedate:[{start_str}+TO+{end_str}]"
         "&count=receivedate"
     )
@@ -89,8 +89,8 @@ def fetch_fixed_range_and_to_bq():
       2) Chama a API openFDA (404 => "sem resultados").
       3) Converte retorno em DataFrame diário (time, events).
       4) Grava no BigQuery (append) com colunas:
-           - time   (TIMESTAMP UTC do dia)
-           - events (contagem diária)
+           - time      (TIMESTAMP UTC do dia)
+           - events    (contagem diária)
            - win_start (DATE)  -> início do intervalo consultado
            - win_end   (DATE)  -> fim do intervalo consultado
            - drug      (STRING)-> termo consultado (p/ rastreio)
@@ -112,7 +112,7 @@ def fetch_fixed_range_and_to_bq():
     df = df.rename(columns={"count": "events"})
     df["win_start"] = pd.to_datetime(TEST_START)
     df["win_end"]   = pd.to_datetime(TEST_END)
-    df["drug"]      = DRUG_QUERY.replace("+", " ")  # para ficar legível no BQ
+    df["drug"]      = DRUG_QUERY  # generic_name já está legível
 
     print("[openFDA] Prévia dos dados:\n", df.head().to_string())
 
@@ -145,14 +145,15 @@ def fetch_fixed_range_and_to_bq():
 # DEFINIÇÃO DA DAG
 # ============================================================
 @dag(
-    dag_id="openfda_mcb2_full",
+    dag_id="openfda_semaglutina_full",
     schedule="@once",  # roda uma vez (é teste de intervalo fixo); mude para @daily se quiser
     start_date=pendulum.datetime(2025, 9, 23, tz="UTC"),
     catchup=False,     # como é intervalo fixo, não queremos runs históricos
     max_active_runs=1,
     tags=["openfda", "bigquery", "test", "range"],
 )
-def openfda_semaglutina():
+def openfda_semaglutina_full():
     fetch_fixed_range_and_to_bq()
 
-dag = openfda_semaglutina()
+# ✅ Corrigido: instanciando a função correta
+dag = openfda_semaglutina_full()
