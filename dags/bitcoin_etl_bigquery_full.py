@@ -4,7 +4,8 @@ from __future__ import annotations
 # Airflow
 from airflow.decorators import dag, task
 from airflow.operators.python import get_current_context
-from airflow.models import Variable
+#from airflow.models import Variable
+from airflow.sdk import Variable
 from airflow.exceptions import AirflowFailException
 
 # Datas / terceiros
