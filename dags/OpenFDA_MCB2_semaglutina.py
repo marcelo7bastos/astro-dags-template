@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from airflow.decorators import dag, task
-from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook  # ainda usado pela task antiga
 
 import pendulum
 import pandas as pd
@@ -13,7 +13,7 @@ from datetime import date
 # CONFIGURAÇÕES GERAIS (edite aqui para ajustes rápidos)
 # ============================================================
 
-# --- Alvo no BigQuery ---
+# --- Alvo no BigQuery (usado pela task agregada antiga) ---
 GCP_PROJECT  = "365846072239"
 BQ_DATASET   = "dataset_fda"
 BQ_TABLE     = "openfda_semaglutina"   # tabela de teste (intervalo fixo; agregação diária)
@@ -25,17 +25,14 @@ USE_POOL     = True
 POOL_NAME    = "openfda_api"    # se não quiser pool, defina USE_POOL=False
 
 # --- Parâmetros do teste (INTERVALO FIXO) ---
-# Esta seção faz a DAG consultar SEMPRE o mesmo intervalo,
-# igual ao que você testou no navegador.
 TEST_START = date(2025, 1, 1)   # AAAA, M, D
 TEST_END   = date(2025, 3, 29)  # inclusive
-DRUG_QUERY = "semaglutide"      # ✅ alinhado ao seu teste por generic_name
+DRUG_QUERY = "semaglutide"      # alinhado ao teste por generic_name
 
-# Observação:
-# - Mantemos agregação DIÁRIA (count=receivedate) — exatamente como na URL.
-# - Se quiser voltar ao modo “um dia por execução”, basta criar outra task
-#   com `data_interval_start` e trocar a montagem da URL (ver notas no fim).
-# ============================================================
+# --- Parâmetros do passo 4 (eventos brutos / paginação simples) ---
+RAW_LIMIT      = 100   # registros por página
+RAW_MAX_PAGES  = 5     # nº máximo de páginas (100 * 5 = 500 eventos)
+RAW_TIMEOUT    = 45    # segundos
 
 # Sessão HTTP com cabeçalho “educado”
 SESSION = requests.Session()
@@ -43,30 +40,42 @@ SESSION.headers.update(
     {"User-Agent": "mda-openfda-etl/1.0 (contato: marceloc.bastos@hotmail.com)"}
 )
 
+# ============================================================
+# Helpers HTTP
+# ============================================================
 
-def _openfda_get(url: str) -> dict:
+def _openfda_get(url: str, params: dict | None = None, *, timeout: int = 30) -> dict:
     """
-    Chamada simples à openFDA **sem retries**.
-    IMPORTANTE: a openFDA retorna **404** quando não há resultados para a query.
-    Aqui tratamos 404 como "vazio" (results=[]), para o task concluir com sucesso.
+    Chamada simples à openFDA (sem retries).
+    404 => retorna {"results": []} para concluir sem erro.
     """
-    r = SESSION.get(url, timeout=30)
+    r = SESSION.get(url, params=params, timeout=timeout)
     if r.status_code == 404:
         return {"results": []}
     r.raise_for_status()
     return r.json()
 
 
-def _build_openfda_url(start: date, end: date, drug_query: str) -> str:
+def _build_search_expr(start: date, end: date, drug_query: str) -> str:
     """
-    Monta a URL da openFDA exatamente como no seu teste:
-      - filtro em patient.drug.openfda.generic_name:"<drug_query>"
-      - janela de receivedate [start .. end] (formato AAAAMMDD)
-      - count=receivedate  -> buckets diários
+    Expressão de busca SEM 'count' (para eventos brutos):
+      patient.drug.openfda.generic_name:"<drug_query>"
+      AND receivedate:[YYYYMMDD TO YYYYMMDD]
     """
     start_str = start.strftime("%Y%m%d")
     end_str   = end.strftime("%Y%m%d")
-    # Observação: o termo da droga é simples (sem espaços) no generic_name.
+    return (
+        f'patient.drug.openfda.generic_name:"{drug_query}"'
+        f'+AND+receivedate:[{start_str}+TO+{end_str}]'
+    )
+
+
+def _build_openfda_count_url(start: date, end: date, drug_query: str) -> str:
+    """
+    URL com count=receivedate (sua task antiga de agregação diária).
+    """
+    start_str = start.strftime("%Y%m%d")
+    end_str   = end.strftime("%Y%m%d")
     return (
         "https://api.fda.gov/drug/event.json"
         f"?search=patient.drug.openfda.generic_name:%22{drug_query}%22"
@@ -74,53 +83,38 @@ def _build_openfda_url(start: date, end: date, drug_query: str) -> str:
         "&count=receivedate"
     )
 
-
 # Decorator do task: sem retries; pool opcional
 _task_kwargs = dict(retries=0)
 if USE_POOL:
     _task_kwargs["pool"] = POOL_NAME
 
+# ============================================================
+# TASK (antiga): agregação diária -> BigQuery
+# ============================================================
 
 @task(**_task_kwargs)
 def fetch_fixed_range_and_to_bq():
-    """
-    Task de TESTE por intervalo fixo:
-      1) Monta a URL com TEST_START..TEST_END e DRUG_QUERY.
-      2) Chama a API openFDA (404 => "sem resultados").
-      3) Converte retorno em DataFrame diário (time, events).
-      4) Grava no BigQuery (append) com colunas:
-           - time      (TIMESTAMP UTC do dia)
-           - events    (contagem diária)
-           - win_start (DATE)  -> início do intervalo consultado
-           - win_end   (DATE)  -> fim do intervalo consultado
-           - drug      (STRING)-> termo consultado (p/ rastreio)
-    """
-    # 1) Monta a URL EXATAMENTE como a que funcionou no navegador
-    url = _build_openfda_url(TEST_START, TEST_END, DRUG_QUERY)
-    print("[openFDA] URL:", url)
+    url = _build_openfda_count_url(TEST_START, TEST_END, DRUG_QUERY)
+    print("[openFDA] URL (count):", url)
 
-    # 2) Chama a API e trata “sem resultados”
-    data = _openfda_get(url)
+    data = _openfda_get(url, timeout=RAW_TIMEOUT)
     results = data.get("results", [])
     if not results:
-        print(f"[openFDA] Sem resultados para {TEST_START}..{TEST_END} (drug={DRUG_QUERY}).")
+        print(f"[openFDA] Sem resultados (count) para {TEST_START}..{TEST_END} (drug={DRUG_QUERY}).")
         return
 
-    # 3) Converte para DataFrame
     df = pd.DataFrame(results)  # colunas: time (AAAAMMDD), count
     df["time"] = pd.to_datetime(df["time"], format="%Y%m%d", utc=True)
     df = df.rename(columns={"count": "events"})
     df["win_start"] = pd.to_datetime(TEST_START)
     df["win_end"]   = pd.to_datetime(TEST_END)
-    df["drug"]      = DRUG_QUERY  # generic_name já está legível
+    df["drug"]      = DRUG_QUERY
 
-    print("[openFDA] Prévia dos dados:\n", df.head().to_string())
+    print("[openFDA] Prévia (count):\n", df.head().to_string())
 
-    # 4) Escreve no BigQuery
     bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
     credentials = bq_hook.get_credentials()
 
-    # Esquema explícito (bom para evitar inferências ruins do pandas-gbq)
     schema = [
         {"name": "time",      "type": "TIMESTAMP"},
         {"name": "events",    "type": "INTEGER"},
@@ -132,7 +126,7 @@ def fetch_fixed_range_and_to_bq():
     df.to_gbq(
         destination_table=f"{BQ_DATASET}.{BQ_TABLE}",
         project_id=GCP_PROJECT,
-        if_exists="append",           # teste: acrescenta linhas
+        if_exists="append",
         credentials=credentials,
         table_schema=schema,
         location=BQ_LOCATION,
@@ -140,20 +134,90 @@ def fetch_fixed_range_and_to_bq():
     )
     print(f"[BQ] Gravados {len(df)} registros em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}.")
 
+# ============================================================
+# PASSO 4 — TASK NOVA: Eventos brutos (preview, sem BQ)
+# ============================================================
+
+@task(**_task_kwargs)
+def fetch_events_raw_preview():
+    """
+    Busca eventos BRUTOS (sem count) com paginação limit/skip.
+    Não grava; apenas imprime uma prévia tabular com campos-chave.
+    """
+    base_url = "https://api.fda.gov/drug/event.json"
+    search_expr = _build_search_expr(TEST_START, TEST_END, DRUG_QUERY)
+    print("[openFDA] search (raw):", search_expr)
+
+    all_rows = []
+    for page in range(RAW_MAX_PAGES):
+        params = {
+            "search": search_expr,
+            "limit": str(RAW_LIMIT),
+            "skip": str(page * RAW_LIMIT),
+            # "sort": "receivedate:desc"  # opcional
+        }
+        payload = _openfda_get(base_url, params=params, timeout=RAW_TIMEOUT)
+        batch = payload.get("results", []) or []
+        print(f"[openFDA] Página {page+1}: {len(batch)} registros")
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < RAW_LIMIT:
+            break
+
+    print(f"[openFDA] Total coletado (raw) = {len(all_rows)}")
+
+    if not all_rows:
+        print("[openFDA] Sem eventos no período para o filtro informado.")
+        return
+
+    # Prévia "flat" para inspeção rápida
+    def first_or_none(seq, key):
+        try:
+            return (seq or [])[0].get(key)
+        except Exception:
+            return None
+
+    preview = []
+    for ev in all_rows[:50]:  # corta para não poluir logs
+        patient = ev.get("patient", {}) or {}
+        reactions = patient.get("reaction", []) or []
+        drugs     = patient.get("drug", []) or []
+        preview.append({
+            "safetyreportid": ev.get("safetyreportid"),
+            "receivedate":    ev.get("receivedate"),
+            "serious":        ev.get("serious"),
+            "patientsex":     patient.get("patientsex"),
+            "primarysourcecountry": ev.get("primarysourcecountry"),
+            "reaction_pt":    first_or_none(reactions, "reactionmeddrapt"),
+            "drug_product":   first_or_none(drugs, "medicinalproduct"),
+        })
+
+    df_prev = pd.DataFrame(preview)
+    # Normaliza data para visualização
+    df_prev["receivedate"] = pd.to_datetime(df_prev["receivedate"], format="%Y%m%d", errors="coerce")
+
+    print("[openFDA] Prévia (raw) — até 50 linhas:")
+    print(df_prev.to_string(index=False))
 
 # ============================================================
 # DEFINIÇÃO DA DAG
 # ============================================================
+
 @dag(
     dag_id="openfda_semaglutina_full",
-    schedule="@once",  # roda uma vez (é teste de intervalo fixo); mude para @daily se quiser
+    schedule="@once",  # mude para @daily quando avançar ao passo 8
     start_date=pendulum.datetime(2025, 9, 23, tz="UTC"),
-    catchup=False,     # como é intervalo fixo, não queremos runs históricos
+    catchup=False,
     max_active_runs=1,
-    tags=["openfda", "bigquery", "test", "range"],
+    tags=["openfda", "faers", "preview", "raw", "range"],
 )
 def openfda_semaglutina_full():
-    fetch_fixed_range_and_to_bq()
+    # 👉 Para este passo, executa só o preview de eventos brutos:
+    fetch_events_raw_preview()
 
-# ✅ Corrigido: instanciando a função correta
+    # Se quiser rodar também a task antiga de agregação e carga no BQ,
+    # basta descomentar a linha abaixo.
+    # fetch_fixed_range_and_to_bq()
+
 dag = openfda_semaglutina_full()
