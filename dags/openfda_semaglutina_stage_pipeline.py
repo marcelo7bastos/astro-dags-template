@@ -145,36 +145,53 @@ def openfda_semaglutina_stage_pipeline():
         }
 
     # 4) AGREGA DIÁRIO NO BIGQUERY (A PARTIR DO STAGE)
-    @task(retries=0)
-    def build_daily_counts(meta: Dict[str, str]) -> None:
-        start, end, drug = meta["start"], meta["end"], meta["drug"]
-        sql = f"""
-        CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}` (
-          day DATE,
-          events INT64,
-          drug STRING
-        );
+@task(retries=0)
+def build_daily_counts(meta: Dict[str, str]) -> None:
+    """
+    Sandbox-friendly:
+    - Faz só SELECT (permitido) para obter as contagens diárias do stage.
+    - Carrega o resultado em `dataset_fda.openfda_semaglutina` via load job
+      (pandas_gbq.to_gbq) com if_exists="replace" para evitar DML.
+    """
+    start, end, drug = meta["start"], meta["end"], meta["drug"]
 
-        -- evita duplicar a mesma janela
-        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}`
-        WHERE day BETWEEN DATE('{start}') AND DATE('{end}')
-          AND drug = '{drug}';
+    # 1) SELECT das contagens (apenas leitura)
+    sql = f"""
+    SELECT
+      receivedate AS day,
+      COUNT(*)    AS events,
+      '{drug}'    AS drug
+    FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
+    WHERE receivedate BETWEEN DATE('{start}') AND DATE('{end}')
+    GROUP BY day
+    ORDER BY day
+    """
+    bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+    client = bq.get_client()
+    df_counts = client.query(sql, location=BQ_LOCATION).to_dataframe()
 
-        INSERT INTO `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}` (day, events, drug)
-        SELECT
-          receivedate AS day,
-          COUNT(*)    AS events,
-          '{drug}'    AS drug
-        FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
-        WHERE receivedate BETWEEN DATE('{start}') AND DATE('{end}')
-        GROUP BY day
-        ORDER BY day;
-        """
-        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-        client = bq.get_client()
-        job = client.query(sql, location=BQ_LOCATION)
-        job.result()
-        print(f"[counts] Tabela {BQ_TABLE_COUNT} atualizada de {start} a {end} (drug={drug}).")
+    if df_counts.empty:
+        print("[counts] Nenhuma linha para agregar.")
+        return
+
+    # 2) Carrega o resultado para a tabela de counts
+    schema_counts = [
+        {"name": "day",    "type": "DATE"},
+        {"name": "events", "type": "INTEGER"},
+        {"name": "drug",   "type": "STRING"},
+    ]
+    creds = bq.get_credentials()
+    df_counts.to_gbq(
+        destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
+        project_id=GCP_PROJECT,
+        if_exists="replace",         # <<< evita DELETE/INSERT (DML)
+        credentials=creds,
+        table_schema=schema_counts,
+        location=BQ_LOCATION,
+        progress_bar=False,
+    )
+    print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
+
 
     # encadeamento: consulta → trata → salva → agrega
     build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
