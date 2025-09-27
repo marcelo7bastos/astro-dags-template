@@ -15,8 +15,8 @@ from typing import Any, Dict, List
 # ========================= Config =========================
 GCP_PROJECT    = "365846072239"
 BQ_DATASET     = "dataset_fda"
-BQ_TABLE_STAGE = "semaglutide_events_stage"   # 3º passo (salva flat)
-BQ_TABLE_COUNT = "openfda_semaglutina"        # 4º passo (agrega diário)
+BQ_TABLE_STAGE = "semaglutide_events_stage"   # stage (flat)
+BQ_TABLE_COUNT = "openfda_semaglutina"        # contagem diária
 BQ_LOCATION    = "US"
 GCP_CONN_ID    = "google_cloud_default"
 
@@ -35,30 +35,26 @@ SESSION.headers.update({"User-Agent": "didactic-openfda-etl/1.0 (contato: exempl
 
 # ========================= Helpers =========================
 def _search_expr_by_day(day: date, drug_query: str) -> str:
-    """Filtro por igualdade (1 dia) evita problemas do range [d TO d]."""
     d = day.strftime("%Y%m%d")
     return f'patient.drug.openfda.generic_name:"{drug_query}" AND receivedate:{d}'
 
 def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """GET com retries básicos + logs do corpo de erro."""
     for attempt in range(1, MAX_RETRIES + 1):
         r = SESSION.get(url, params=params, timeout=TIMEOUT_S)
         if r.status_code == 404:
             return {"results": []}
         if 200 <= r.status_code < 300:
             return r.json()
-        # log do erro para diagnóstico
         try:
             print("[openFDA][err]", r.status_code, r.json())
         except Exception:
             print("[openFDA][err-text]", r.status_code, r.text[:500])
         if attempt < MAX_RETRIES and r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(attempt)  # backoff leve
+            time.sleep(attempt)
             continue
         r.raise_for_status()
 
 def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Achata campos essenciais (didático)."""
     flat: List[Dict[str, Any]] = []
     for ev in rows:
         patient   = (ev or {}).get("patient", {}) or {}
@@ -96,13 +92,14 @@ def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 )
 def openfda_semaglutina_stage_pipeline():
 
-    # 1) CONSULTA (dia a dia com paginação)
     @task(retries=0)
-    def fetch_raw() -> List[Dict[str, Any]]:
+    def extract_transform_load() -> Dict[str, str]:
         """
-        Busca dia a dia com paginação:
-        - limit=1000 por página (seguro para openFDA)
-        - itera skip até esgotar; 0.25s entre chamadas (≈4 req/s)
+        ETL completo no mesmo task para evitar XCom gigante:
+        - Busca dia a dia com paginação (limit=1000, skip)
+        - Normaliza (flat)
+        - Grava STAGE com if_exists='replace'
+        - Retorna só metadados (pequeno) para o próximo task
         """
         base_url = "https://api.fda.gov/drug/event.json"
         all_rows: List[Dict[str, Any]] = []
@@ -119,41 +116,25 @@ def openfda_semaglutina_stage_pipeline():
                     "limit": str(limit),
                     "skip": str(skip),
                 }
-                print(f"[fetch] Dia {day} | limit={limit} skip={skip} | {params['search']}")
                 payload = _openfda_get(base_url, params)
                 rows = payload.get("results", []) or []
                 all_rows.extend(rows)
                 total_dia += len(rows)
                 n_calls += 1
-
-                if len(rows) < limit:  # esgotou as páginas do dia
+                if len(rows) < limit:
                     break
                 skip += limit
                 time.sleep(0.25)  # rate-limit
-
             print(f"[fetch] {day}: {total_dia} registros.")
             day = date.fromordinal(day.toordinal() + 1)
-
         print(f"[fetch] Jan–Jun/2025: {n_calls} chamadas, {len(all_rows)} registros no total.")
-        return all_rows
 
-    # 2) TRATAMENTO (NORMALIZAÇÃO MÍNIMA)
-    @task(retries=0)
-    def normalize_minimal(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        df = _to_flat(rows)
-        print(f"[normalize] Linhas pós-normalização: {len(df)}")
+        # Normalize + load stage
+        df = _to_flat(all_rows)
+        print(f"[normalize] linhas pós-normalização: {len(df)}")
         if not df.empty:
-            print("[normalize] Preview:\n", df.head(10).to_string(index=False))
-        return df.to_dict(orient="records")
+            print("[normalize] preview:\n", df.head(10).to_string(index=False))
 
-    # 3) SALVA NO BIGQUERY (STAGE - replace para não duplicar entre runs)
-    @task(retries=0)
-    def load_stage(rows_flat: List[Dict[str, Any]]) -> Dict[str, str]:
-        if not rows_flat:
-            print("[stage] Nada a gravar.")
-            return {"inserted": "0"}
-
-        df = pd.DataFrame(rows_flat)
         schema = [
             {"name": "safetyreportid",       "type": "STRING"},
             {"name": "receivedate",          "type": "DATE"},
@@ -165,21 +146,35 @@ def openfda_semaglutina_stage_pipeline():
         ]
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
         creds = bq.get_credentials()
-        df.to_gbq(
-            destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
-            project_id=GCP_PROJECT,
-            if_exists="replace",  # recria a tabela a cada execução
-            credentials=creds,
-            table_schema=schema,
-            location=BQ_LOCATION,
-            progress_bar=False,
-        )
-        print(f"[stage] Gravados {len(df)} em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
+        if df.empty:
+            # Mesmo assim, "zera" a stage para a janela (replace em vazio)
+            empty = pd.DataFrame(columns=[c["name"] for c in schema])
+            empty.to_gbq(
+                destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
+                project_id=GCP_PROJECT,
+                if_exists="replace",
+                credentials=creds,
+                table_schema=schema,
+                location=BQ_LOCATION,
+                progress_bar=False,
+            )
+            print("[stage] Nenhum registro para gravar, stage substituída por tabela vazia.")
+        else:
+            df.to_gbq(
+                destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
+                project_id=GCP_PROJECT,
+                if_exists="replace",
+                credentials=creds,
+                table_schema=schema,
+                location=BQ_LOCATION,
+                progress_bar=False,
+            )
+            print(f"[stage] Gravados {len(df)} em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
+
         return {"start": TEST_START.strftime("%Y-%m-%d"),
                 "end":   TEST_END.strftime("%Y-%m-%d"),
                 "drug":  DRUG_QUERY}
 
-    # 4) AGREGA DIÁRIO (SELECT + load job; compatível com Sandbox)
     @task(retries=0)
     def build_daily_counts(meta: Dict[str, str]) -> None:
         start, end, drug = meta["start"], meta["end"], meta["drug"]
@@ -206,7 +201,8 @@ def openfda_semaglutina_stage_pipeline():
         )
         if df_counts.empty:
             print("[counts] Nenhuma linha para agregar.")
-            return
+            # ainda assim, cria a tabela de counts vazia
+            df_counts = pd.DataFrame(columns=["day","events","drug"])
 
         schema_counts = [
             {"name": "day",    "type": "DATE"},
@@ -224,7 +220,6 @@ def openfda_semaglutina_stage_pipeline():
         )
         print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
 
-    # Encadeamento
-    build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
+    build_daily_counts(extract_transform_load())
 
 openfda_semaglutina_stage_pipeline()
