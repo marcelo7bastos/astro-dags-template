@@ -21,7 +21,7 @@ GCP_CONN_ID    = "google_cloud_default"
 
 # Janela pequena p/ didático (uma chamada)
 TEST_START = date(2025, 1, 1)
-TEST_END   = date(2025, 1, 15)
+TEST_END   = date(2025, 6, 30)   # inclusive
 DRUG_QUERY = "semaglutide"
 
 API_LIMIT   = 200   # 1 página só para manter XCom pequeno e simples
@@ -90,13 +90,32 @@ def openfda_semaglutina_stage_pipeline():
 
     @task(retries=0)
     def fetch_raw() -> List[Dict[str, Any]]:
+        """
+        Busca dia a dia (didático, seguro contra truncamento).
+        - limit=5000 por dia (suficiente na prática para semaglutide)
+        - breve sleep para respeitar rate limit (~5 req/s -> usamos 0.25s)
+        """
         base_url = "https://api.fda.gov/drug/event.json"
-        params = {"search": _search_expr(TEST_START, TEST_END, DRUG_QUERY), "limit": str(API_LIMIT)}
-        print("[fetch] Params:", params)
-        payload = _openfda_get(base_url, params)
-        rows = payload.get("results", []) or []
-        print(f"[fetch] Recebidos {len(rows)} registros.")
-        return rows
+        all_rows: List[Dict[str, Any]] = []
+    
+        day = TEST_START
+        n_calls = 0
+        while day <= TEST_END:
+            params = {
+                "search": _search_expr(day, day, DRUG_QUERY),  # mesma data no início/fim
+                "limit": "5000",
+            }
+            print(f"[fetch] Dia {day} | Params: {params}")
+            payload = _openfda_get(base_url, params)
+            rows = payload.get("results", []) or []
+            all_rows.extend(rows)
+            n_calls += 1
+            # Respeitar rate-limit (~0.25s entre chamadas = 4 req/s máx)
+            time.sleep(0.25)
+            day = date.fromordinal(day.toordinal() + 1)
+    
+        print(f"[fetch] Jan–Jun/2025: {n_calls} chamadas, {len(all_rows)} registros no total.")
+        return all_rows
 
     @task(retries=0)
     def normalize_minimal(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
