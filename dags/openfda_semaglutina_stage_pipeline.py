@@ -8,6 +8,7 @@ import pendulum
 import pandas as pd
 import pandas_gbq
 import requests
+import time 
 from datetime import date
 from typing import Any, Dict, List
 
