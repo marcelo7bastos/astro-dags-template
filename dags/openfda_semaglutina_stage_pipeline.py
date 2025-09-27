@@ -6,6 +6,7 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
 import pendulum
 import pandas as pd
+import pandas_gbq
 import requests
 from datetime import date
 from typing import Any, Dict, List
@@ -147,9 +148,13 @@ def openfda_semaglutina_stage_pipeline():
     # 4) AGREGA DIÁRIO (compatível com Sandbox: sem DDL/DML)
     @task(retries=0)
     def build_daily_counts(meta: Dict[str, str]) -> None:
+        """
+        Sandbox-friendly e estável em ambiente isolado:
+        - Lê as contagens com pandas_gbq.read_gbq (sem BigQuery Client/Arrow).
+        - Grava com pandas_gbq.to_gbq (load job). Usa replace para evitar DML.
+        """
         start, end, drug = meta["start"], meta["end"], meta["drug"]
-
-        # SELECT de contagens (apenas leitura)
+    
         sql = f"""
         SELECT
           receivedate AS day,
@@ -160,31 +165,42 @@ def openfda_semaglutina_stage_pipeline():
         GROUP BY day
         ORDER BY day
         """
+    
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-        client = bq.get_client()
-        df_counts = client.query(sql, location=BQ_LOCATION).to_dataframe()
-
+        creds = bq.get_credentials()
+    
+        # SELECT -> DataFrame (sem Arrow)
+        df_counts = pandas_gbq.read_gbq(
+            sql,
+            project_id=GCP_PROJECT,
+            credentials=creds,
+            dialect="standard",
+            progress_bar_type=None,
+        )
+    
         if df_counts.empty:
             print("[counts] Nenhuma linha para agregar.")
             return
-
-        # Grava a tabela de contagens via load job (sem DML)
+    
         schema_counts = [
             {"name": "day",    "type": "DATE"},
             {"name": "events", "type": "INTEGER"},
             {"name": "drug",   "type": "STRING"},
         ]
-        creds = bq.get_credentials()
+    
+        # LOAD job (sem DML), recria a tabela a cada execução (Sandbox-friendly)
         df_counts.to_gbq(
             destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
             project_id=GCP_PROJECT,
-            if_exists="replace",  # recria a cada execução (Sandbox-friendly)
+            if_exists="replace",
             credentials=creds,
             table_schema=schema_counts,
             location=BQ_LOCATION,
             progress_bar=False,
         )
+    
         print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
+
 
     # Encadeamento: consulta → trata → salva → agrega 
     build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
