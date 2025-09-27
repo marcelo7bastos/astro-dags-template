@@ -36,7 +36,6 @@ SESSION.headers.update({"User-Agent": "didactic-openfda-etl/1.0 (contato: exempl
 # ========================= Helpers =========================
 def _search_expr(start: date, end: date, drug_query: str) -> str:
     s = start.strftime("%Y%m%d"); e = end.strftime("%Y%m%d")
-    # Use ESPAÇOS para AND/TO (requests faz o encode)
     return f'patient.drug.openfda.generic_name:"{drug_query}" AND receivedate:[{s} TO {e}]'
 
 def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
@@ -47,12 +46,11 @@ def _openfda_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
         if 200 <= r.status_code < 300:
             return r.json()
         if attempt < MAX_RETRIES and r.status_code in (429, 500, 502, 503, 504):
-            import time; time.sleep(attempt)  # backoff leve
+            import time; time.sleep(attempt)
             continue
         r.raise_for_status()
 
 def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Achata campos essenciais (didático)."""
     flat: List[Dict[str, Any]] = []
     for ev in rows:
         patient   = (ev or {}).get("patient", {}) or {}
@@ -70,6 +68,7 @@ def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(flat)
     if df.empty:
         return df
+    df["safetyreportid"] = df["safetyreportid"].astype(str)   # 🔹 forçar string
     df["receivedate"] = pd.to_datetime(df["receivedate"], format="%Y%m%d", errors="coerce").dt.date
     for col in ["patientsex", "serious"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
@@ -89,7 +88,6 @@ def _to_flat(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 )
 def openfda_semaglutina_stage_pipeline():
 
-    # 1) CONSULTA
     @task(retries=0)
     def fetch_raw() -> List[Dict[str, Any]]:
         base_url = "https://api.fda.gov/drug/event.json"
@@ -100,7 +98,6 @@ def openfda_semaglutina_stage_pipeline():
         print(f"[fetch] Recebidos {len(rows)} registros.")
         return rows
 
-    # 2) TRATAMENTO (NORMALIZAÇÃO MÍNIMA)
     @task(retries=0)
     def normalize_minimal(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         df = _to_flat(rows)
@@ -109,7 +106,6 @@ def openfda_semaglutina_stage_pipeline():
             print("[normalize] Preview:\n", df.head(10).to_string(index=False))
         return df.to_dict(orient="records")
 
-    # 3) SALVA NO BIGQUERY (STAGE)
     @task(retries=0)
     def load_stage(rows_flat: List[Dict[str, Any]]) -> Dict[str, str]:
         if not rows_flat:
@@ -131,30 +127,21 @@ def openfda_semaglutina_stage_pipeline():
         df.to_gbq(
             destination_table=f"{BQ_DATASET}.{BQ_TABLE_STAGE}",
             project_id=GCP_PROJECT,
-            if_exists="append",
+            if_exists="replace",  # 🔹 evita duplicação ao rerodar mesma janela
             credentials=creds,
             table_schema=schema,
             location=BQ_LOCATION,
             progress_bar=False,
         )
         print(f"[stage] Gravados {len(df)} em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}.")
-        # passa janela para o passo 4
-        return {
-            "start": TEST_START.strftime("%Y-%m-%d"),
-            "end":   TEST_END.strftime("%Y-%m-%d"),
-            "drug":  DRUG_QUERY,
-        }
+        return {"start": TEST_START.strftime("%Y-%m-%d"),
+                "end":   TEST_END.strftime("%Y-%m-%d"),
+                "drug":  DRUG_QUERY}
 
-    # 4) AGREGA DIÁRIO (compatível com Sandbox: sem DDL/DML)
     @task(retries=0)
     def build_daily_counts(meta: Dict[str, str]) -> None:
-        """
-        Sandbox-friendly e estável em ambiente isolado:
-        - Lê as contagens com pandas_gbq.read_gbq (sem BigQuery Client/Arrow).
-        - Grava com pandas_gbq.to_gbq (load job). Usa replace para evitar DML.
-        """
         start, end, drug = meta["start"], meta["end"], meta["drug"]
-    
+
         sql = f"""
         SELECT
           receivedate AS day,
@@ -165,30 +152,25 @@ def openfda_semaglutina_stage_pipeline():
         GROUP BY day
         ORDER BY day
         """
-    
         bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
         creds = bq.get_credentials()
-    
-        # SELECT -> DataFrame (sem Arrow)
         df_counts = pandas_gbq.read_gbq(
             sql,
             project_id=GCP_PROJECT,
             credentials=creds,
             dialect="standard",
             progress_bar_type=None,
+            location=BQ_LOCATION,   # 🔹 manter mesma região
         )
-    
         if df_counts.empty:
             print("[counts] Nenhuma linha para agregar.")
             return
-    
+
         schema_counts = [
             {"name": "day",    "type": "DATE"},
             {"name": "events", "type": "INTEGER"},
             {"name": "drug",   "type": "STRING"},
         ]
-    
-        # LOAD job (sem DML), recria a tabela a cada execução (Sandbox-friendly)
         df_counts.to_gbq(
             destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
             project_id=GCP_PROJECT,
@@ -198,11 +180,8 @@ def openfda_semaglutina_stage_pipeline():
             location=BQ_LOCATION,
             progress_bar=False,
         )
-    
         print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
 
-
-    # Encadeamento: consulta → trata → salva → agrega 
     build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
 
 openfda_semaglutina_stage_pipeline()
