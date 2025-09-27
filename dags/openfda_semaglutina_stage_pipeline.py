@@ -186,7 +186,7 @@ def openfda_semaglutina_stage_pipeline():
         )
         print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
 
-    # Encadeamento: consulta → trata → salva → agrega
+    # Encadeamento: consulta → trata → salva → agrega 
     build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
 
 openfda_semaglutina_stage_pipeline()
