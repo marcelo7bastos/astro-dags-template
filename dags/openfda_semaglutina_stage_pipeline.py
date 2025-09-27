@@ -11,12 +11,12 @@ from datetime import date
 from typing import Any, Dict, List
 
 # ========================= Config =========================
-GCP_PROJECT   = "365846072239"
-BQ_DATASET    = "dataset_fda"
+GCP_PROJECT    = "365846072239"
+BQ_DATASET     = "dataset_fda"
 BQ_TABLE_STAGE = "semaglutide_events_stage"   # 3º passo (salva flat)
 BQ_TABLE_COUNT = "openfda_semaglutina"        # 4º passo (agrega diário)
-BQ_LOCATION   = "US"
-GCP_CONN_ID   = "google_cloud_default"
+BQ_LOCATION    = "US"
+GCP_CONN_ID    = "google_cloud_default"
 
 # Janela pequena p/ didático (uma chamada)
 TEST_START = date(2025, 1, 1)
@@ -144,56 +144,49 @@ def openfda_semaglutina_stage_pipeline():
             "drug":  DRUG_QUERY,
         }
 
-    # 4) AGREGA DIÁRIO NO BIGQUERY (A PARTIR DO STAGE)
-@task(retries=0)
-def build_daily_counts(meta: Dict[str, str]) -> None:
-    """
-    Sandbox-friendly:
-    - Faz só SELECT (permitido) para obter as contagens diárias do stage.
-    - Carrega o resultado em `dataset_fda.openfda_semaglutina` via load job
-      (pandas_gbq.to_gbq) com if_exists="replace" para evitar DML.
-    """
-    start, end, drug = meta["start"], meta["end"], meta["drug"]
+    # 4) AGREGA DIÁRIO (compatível com Sandbox: sem DDL/DML)
+    @task(retries=0)
+    def build_daily_counts(meta: Dict[str, str]) -> None:
+        start, end, drug = meta["start"], meta["end"], meta["drug"]
 
-    # 1) SELECT das contagens (apenas leitura)
-    sql = f"""
-    SELECT
-      receivedate AS day,
-      COUNT(*)    AS events,
-      '{drug}'    AS drug
-    FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
-    WHERE receivedate BETWEEN DATE('{start}') AND DATE('{end}')
-    GROUP BY day
-    ORDER BY day
-    """
-    bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-    client = bq.get_client()
-    df_counts = client.query(sql, location=BQ_LOCATION).to_dataframe()
+        # SELECT de contagens (apenas leitura)
+        sql = f"""
+        SELECT
+          receivedate AS day,
+          COUNT(*)    AS events,
+          '{drug}'    AS drug
+        FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_STAGE}`
+        WHERE receivedate BETWEEN DATE('{start}') AND DATE('{end}')
+        GROUP BY day
+        ORDER BY day
+        """
+        bq = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
+        client = bq.get_client()
+        df_counts = client.query(sql, location=BQ_LOCATION).to_dataframe()
 
-    if df_counts.empty:
-        print("[counts] Nenhuma linha para agregar.")
-        return
+        if df_counts.empty:
+            print("[counts] Nenhuma linha para agregar.")
+            return
 
-    # 2) Carrega o resultado para a tabela de counts
-    schema_counts = [
-        {"name": "day",    "type": "DATE"},
-        {"name": "events", "type": "INTEGER"},
-        {"name": "drug",   "type": "STRING"},
-    ]
-    creds = bq.get_credentials()
-    df_counts.to_gbq(
-        destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
-        project_id=GCP_PROJECT,
-        if_exists="replace",         # <<< evita DELETE/INSERT (DML)
-        credentials=creds,
-        table_schema=schema_counts,
-        location=BQ_LOCATION,
-        progress_bar=False,
-    )
-    print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
+        # Grava a tabela de contagens via load job (sem DML)
+        schema_counts = [
+            {"name": "day",    "type": "DATE"},
+            {"name": "events", "type": "INTEGER"},
+            {"name": "drug",   "type": "STRING"},
+        ]
+        creds = bq.get_credentials()
+        df_counts.to_gbq(
+            destination_table=f"{BQ_DATASET}.{BQ_TABLE_COUNT}",
+            project_id=GCP_PROJECT,
+            if_exists="replace",  # recria a cada execução (Sandbox-friendly)
+            credentials=creds,
+            table_schema=schema_counts,
+            location=BQ_LOCATION,
+            progress_bar=False,
+        )
+        print(f"[counts] {len(df_counts)} linhas gravadas em {GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE_COUNT}.")
 
-
-    # encadeamento: consulta → trata → salva → agrega
+    # Encadeamento: consulta → trata → salva → agrega
     build_daily_counts(load_stage(normalize_minimal(fetch_raw())))
 
 openfda_semaglutina_stage_pipeline()
